@@ -1,0 +1,221 @@
+{
+  "name": "Mounja Carousel Generator",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "mounja-carousel",
+        "responseMode": "responseNode",
+        "options": { "rawBody": false }
+      },
+      "id": "webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [100, 300],
+      "webhookId": "mounja-carousel"
+    },
+    {
+      "parameters": {
+        "jsCode": "const tema = ($json.body && $json.body.tema) || $json.tema;\nif (!tema || typeof tema !== 'string') throw new Error('campo \"tema\" obrigatório no body');\nconst slug = tema.toLowerCase()\n  .normalize('NFD').replace(/[\\u0300-\\u036f]/g, '')\n  .replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);\nconst runDir = `/data/outputs/${slug}-${Date.now()}`;\nconst fs = require('fs');\nfs.mkdirSync(`${runDir}/assets`, { recursive: true });\nreturn [{ json: { tema, slug, runDir } }];"
+      },
+      "id": "parse",
+      "name": "Parse Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, 300]
+    },
+    {
+      "parameters": {
+        "resource": "folder",
+        "name": "={{$json.slug}}",
+        "driveId": { "mode": "list", "value": "My Drive" },
+        "folderId": { "mode": "list", "value": "root" },
+        "options": {}
+      },
+      "id": "drive-create-folder",
+      "name": "Drive Create Folder",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "command": "cat /data/scripts/meta_prompt_copy.md"
+      },
+      "id": "load-meta-prompt",
+      "name": "Load Meta Prompt",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [700, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const ctx = $('Parse Input').item.json;\nconst folderId = $('Drive Create Folder').item.json.id;\nconst metaPrompt = $json.stdout;\nif (!metaPrompt || metaPrompt.length < 100) throw new Error('meta_prompt_copy.md não encontrado em /data/scripts/');\nreturn [{ json: { ...ctx, metaPrompt, driveFolderId: folderId } }];"
+      },
+      "id": "merge-context",
+      "name": "Merge Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "key", "value": "={{$env.GEMINI_API_KEY}}" }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"system_instruction\": { \"parts\": [{ \"text\": $json.metaPrompt }] },\n  \"contents\": [{ \"role\": \"user\", \"parts\": [{ \"text\": \"Tema do carrossel: \" + $json.tema }] }],\n  \"generationConfig\": {\n    \"temperature\": 0.85,\n    \"response_mime_type\": \"application/json\"\n  }\n}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "gemini-copy",
+      "name": "Gemini - Generate Copy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const raw = $json.candidates && $json.candidates[0] && $json.candidates[0].content.parts[0].text;\nif (!raw) throw new Error('Gemini não retornou texto. Resposta: ' + JSON.stringify($json).slice(0, 500));\nlet copy;\ntry { copy = JSON.parse(raw); } catch (e) { throw new Error('JSON inválido do Gemini: ' + raw.slice(0, 400)); }\nif (!copy.slides || copy.slides.length < 5 || copy.slides.length > 15)\n  throw new Error('n_slides fora do range 5-15 (recebido: ' + (copy.slides||[]).length + ')');\nif (copy.slides[0].tipo !== 'hook') throw new Error('slide 1 precisa ser tipo \"hook\"');\nif (copy.slides[copy.slides.length-1].tipo !== 'cta') throw new Error('último slide precisa ser tipo \"cta\"');\nconst ctx = $('Parse Input').item.json;\nconst folderId = $('Drive Create Folder').item.json.id;\nconst fs = require('fs');\nfs.writeFileSync(`${ctx.runDir}/copy.json`, JSON.stringify(copy, null, 2));\nfs.writeFileSync(`${ctx.runDir}/caption.md`, copy.caption || '');\nreturn copy.slides.map(s => ({ json: {\n  ...s,\n  runDir: ctx.runDir,\n  slug: ctx.slug,\n  tema: ctx.tema,\n  driveFolderId: folderId,\n  totalSlides: copy.slides.length,\n  caption: copy.caption,\n  copyRaw: copy\n}}));"
+      },
+      "id": "validate-copy",
+      "name": "Validate & Split Slides",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "loop",
+      "name": "Loop Slides",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1500, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [{ "name": "key", "value": "={{$env.GEMINI_API_KEY}}" }]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Content-Type", "value": "application/json" }]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"contents\": [{ \"role\": \"user\", \"parts\": [{ \"text\": \"Generate a PNG with FULLY TRANSPARENT background (alpha channel). NO background color, NO scene, NO floor, NO shadow on ground. Subject isolated on pure transparency. Cinematic studio lighting with rim light in brand palette pink #F0339E transitioning to purple #7B2CBF. No text, no logos, no watermarks, no human faces. Style modifier: \" + $json.asset_type + \". Subject: \" + $json.asset_description }] }],\n  \"generationConfig\": { \"responseModalities\": [\"IMAGE\"] }\n}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "gemini-image",
+      "name": "Gemini - Generate Asset",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1700, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const fs = require('fs');\nconst slide = $('Loop Slides').item.json;\nconst parts = ($json.candidates && $json.candidates[0] && $json.candidates[0].content.parts) || [];\nconst imgPart = parts.find(p => p.inline_data || p.inlineData);\nif (!imgPart) throw new Error('Gemini Image não retornou imagem para slide ' + slide.n);\nconst data = (imgPart.inline_data || imgPart.inlineData).data;\nconst n = String(slide.n).padStart(2, '0');\nconst assetPath = `${slide.runDir}/assets/slide_${n}.png`;\nconst slidePath = `${slide.runDir}/slide_${n}.png`;\nconst slideJsonPath = `${slide.runDir}/assets/slide_${n}.json`;\nfs.writeFileSync(assetPath, Buffer.from(data, 'base64'));\nfs.writeFileSync(slideJsonPath, JSON.stringify(slide));\nreturn [{ json: { ...slide, assetPath, slidePath, slideJsonPath, n } }];"
+      },
+      "id": "save-asset",
+      "name": "Save Asset",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1900, 300]
+    },
+    {
+      "parameters": {
+        "command": "=cd /data/scripts && python3 compose_slide.py --slide-json \"{{$json.slideJsonPath}}\" --asset \"{{$json.assetPath}}\" --out \"{{$json.slidePath}}\" --total {{$json.totalSlides}}"
+      },
+      "id": "compose",
+      "name": "Compose Slide (Python)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [2100, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "if ($json.exitCode && $json.exitCode !== 0) throw new Error('compose_slide.py falhou: ' + ($json.stderr || ''));\nconst slide = $('Save Asset').item.json;\nconst fs = require('fs');\nconst buf = fs.readFileSync(slide.slidePath);\nreturn [{\n  json: { ...slide },\n  binary: { data: { data: buf.toString('base64'), mimeType: 'image/png', fileName: `slide_${slide.n}.png` } }\n}];"
+      },
+      "id": "read-png",
+      "name": "Read Slide PNG",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2300, 300]
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "operation": "upload",
+        "name": "=slide_{{$json.n}}.png",
+        "driveId": { "mode": "list", "value": "My Drive" },
+        "folderId": "={{$json.driveFolderId}}",
+        "options": {}
+      },
+      "id": "drive-upload-slide",
+      "name": "Drive Upload Slide",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [2500, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const uploads = $('Drive Upload Slide').all();\nconst ctx = $('Parse Input').item.json;\nconst copy = $('Validate & Split Slides').first().json.copyRaw;\nconst folderId = $('Drive Create Folder').item.json.id;\nconst slides = uploads.map(u => ({\n  n: u.json.n,\n  name: u.json.name,\n  url: u.json.webViewLink || u.json.webContentLink || null,\n  id: u.json.id\n})).sort((a, b) => String(a.n).localeCompare(String(b.n)));\nreturn [{ json: {\n  ok: true,\n  slug: ctx.slug,\n  tema: ctx.tema,\n  n_slides: slides.length,\n  folderId,\n  folderUrl: `https://drive.google.com/drive/folders/${folderId}`,\n  slides,\n  caption: copy.caption,\n  padroes_usados: copy.padroes_usados || []\n}}];"
+      },
+      "id": "finalize",
+      "name": "Finalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1900, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2100, 500]
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "Parse Input", "type": "main", "index": 0 }]] },
+    "Parse Input": { "main": [[{ "node": "Drive Create Folder", "type": "main", "index": 0 }]] },
+    "Drive Create Folder": { "main": [[{ "node": "Load Meta Prompt", "type": "main", "index": 0 }]] },
+    "Load Meta Prompt": { "main": [[{ "node": "Merge Context", "type": "main", "index": 0 }]] },
+    "Merge Context": { "main": [[{ "node": "Gemini - Generate Copy", "type": "main", "index": 0 }]] },
+    "Gemini - Generate Copy": { "main": [[{ "node": "Validate & Split Slides", "type": "main", "index": 0 }]] },
+    "Validate & Split Slides": { "main": [[{ "node": "Loop Slides", "type": "main", "index": 0 }]] },
+    "Loop Slides": {
+      "main": [
+        [{ "node": "Finalize", "type": "main", "index": 0 }],
+        [{ "node": "Gemini - Generate Asset", "type": "main", "index": 0 }]
+      ]
+    },
+    "Gemini - Generate Asset": { "main": [[{ "node": "Save Asset", "type": "main", "index": 0 }]] },
+    "Save Asset": { "main": [[{ "node": "Compose Slide (Python)", "type": "main", "index": 0 }]] },
+    "Compose Slide (Python)": { "main": [[{ "node": "Read Slide PNG", "type": "main", "index": 0 }]] },
+    "Read Slide PNG": { "main": [[{ "node": "Drive Upload Slide", "type": "main", "index": 0 }]] },
+    "Drive Upload Slide": { "main": [[{ "node": "Loop Slides", "type": "main", "index": 0 }]] },
+    "Finalize": { "main": [[{ "node": "Respond", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" }
+}
